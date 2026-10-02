@@ -1,233 +1,369 @@
 import asyncio
-
 import json
-
 import time
-
 import websockets
 
+
+# ==========================================
+# SETTINGS
+# ==========================================
+
 SYMBOLS = [
-
     "BTCUSDT",
-
     "ETHUSDT",
-
     "SOLUSDT",
-
     "XRPUSDT",
-
     "DOGEUSDT",
-
 ]
 
-BINANCE_URL = "wss://stream.binance.com:9443/stream"
+TRADE_SIZE_USD = 500
 
-OKX_URL = "wss://ws.okx.com:8443/ws/v5/public"
+# Temporary assumptions.
+# We will replace these with your actual fee tiers later.
+BINANCE_FEE = 0.001
+OKX_FEE = 0.001
+
+# Minimum NET edge required.
+MIN_NET_EDGE = 0.0005
+
+
+# ==========================================
+# WEBSOCKET URLS
+# ==========================================
+
+BINANCE_URL = "wss://stream.binance.com:9443/stream"
+OKX_URL = "wss://ws.okx.com/ws/v5/public"
+
+
+# ==========================================
+# LOCAL MARKET DATA
+# ==========================================
+
+books = {
+    "binance": {},
+    "okx": {}
+}
+
+
+# ==========================================
+# VWAP
+# ==========================================
+
+def calculate_vwap(levels, usd_size):
+
+    remaining_usd = usd_size
+    total_base = 0.0
+    total_usd = 0.0
+
+    for price, quantity in levels:
+
+        price = float(price)
+        quantity = float(quantity)
+
+        level_usd = price * quantity
+
+        take_usd = min(remaining_usd, level_usd)
+
+        if take_usd <= 0:
+            continue
+
+        base_amount = take_usd / price
+
+        total_base += base_amount
+        total_usd += take_usd
+
+        remaining_usd -= take_usd
+
+        if remaining_usd <= 0:
+            break
+
+    if total_base == 0:
+        return None
+
+    if remaining_usd > 0:
+        return None
+
+    return total_usd / total_base
+
+
+# ==========================================
+# BINANCE
+# ==========================================
 
 async def binance():
 
     streams = [
-
-        f"{symbol.lower()}@bookTicker"
-
+        f"{symbol.lower()}@depth20@100ms"
         for symbol in SYMBOLS
-
     ]
 
     params = {
-
         "method": "SUBSCRIBE",
-
         "params": streams,
-
         "id": 1
-
     }
 
-    async with websockets.connect(BINANCE_URL) as ws:
+    while True:
 
-        await ws.send(json.dumps(params))
+        try:
 
-        async for message in ws:
+            async with websockets.connect(
+                BINANCE_URL,
+                ping_interval=20,
+                ping_timeout=20
+            ) as ws:
 
-            data = json.loads(message)
+                await ws.send(json.dumps(params))
 
-            if "data" not in data:
+                async for message in ws:
 
-                continue
+                    data = json.loads(message)
 
-            ticker = data["data"]
+                    if "data" not in data:
+                        continue
 
-            symbol = ticker["s"]
+                    payload = data["data"]
 
-            bid = float(ticker["b"])
+                    symbol = payload.get("s")
 
-            ask = float(ticker["a"])
+                    if symbol not in SYMBOLS:
+                        continue
 
-            prices["binance"][symbol] = {
+                    bids = payload.get("bids", [])
+                    asks = payload.get("asks", [])
 
-                "bid": bid,
+                    if not bids or not asks:
+                        continue
 
-                "ask": ask,
+                    books["binance"][symbol] = {
+                        "bids": bids,
+                        "asks": asks,
+                        "timestamp": time.time()
+                    }
 
-                "time": time.time()
+        except Exception as e:
 
-            }
+            print("Binance connection error:", e)
+
+            await asyncio.sleep(3)
+
+
+# ==========================================
+# OKX
+# ==========================================
 
 async def okx():
 
-    async with websockets.connect(OKX_URL) as ws:
+    while True:
 
-        args = [
+        try:
 
-            {
+            async with websockets.connect(
+                OKX_URL,
+                ping_interval=20,
+                ping_timeout=20
+            ) as ws:
 
-                "channel": "books5",
+                args = [
+                    {
+                        "channel": "books5",
+                        "instId": symbol.replace(
+                            "USDT",
+                            "-USDT"
+                        )
+                    }
+                    for symbol in SYMBOLS
+                ]
 
-                "instId": symbol.replace("USDT", "-USDT")
+                subscribe = {
+                    "op": "subscribe",
+                    "args": args
+                }
 
-            }
+                await ws.send(
+                    json.dumps(subscribe)
+                )
 
-            for symbol in SYMBOLS
+                async for message in ws:
 
-        ]
+                    if message == "pong":
+                        continue
 
-        subscribe = {
+                    data = json.loads(message)
 
-            "op": "subscribe",
+                    if "data" not in data:
+                        continue
 
-            "args": args
+                    if not data["data"]:
+                        continue
 
-        }
+                    book = data["data"][0]
 
-        await ws.send(json.dumps(subscribe))
+                    bids = book.get("bids", [])
+                    asks = book.get("asks", [])
 
-        async for message in ws:
+                    if not bids or not asks:
+                        continue
 
-            if message == "pong":
+                    inst_id = data["arg"]["instId"]
 
-                continue
+                    symbol = inst_id.replace(
+                        "-",
+                        ""
+                    )
 
-            data = json.loads(message)
+                    books["okx"][symbol] = {
+                        "bids": bids,
+                        "asks": asks,
+                        "timestamp": time.time()
+                    }
 
-            if "data" not in data:
+        except Exception as e:
 
-                continue
+            print("OKX connection error:", e)
 
-            if not data["data"]:
+            await asyncio.sleep(3)
 
-                continue
 
-            book = data["data"][0]
-
-            asks = book.get("asks", [])
-
-            bids = book.get("bids", [])
-
-            if not asks or not bids:
-
-                continue
-
-            symbol = data["arg"]["instId"].replace("-", "")
-
-            ask = float(asks[0][0])
-
-            bid = float(bids[0][0])
-
-            prices["okx"][symbol] = {
-
-                "bid": bid,
-
-                "ask": ask,
-
-                "time": time.time()
-
-            }
-
-prices = {
-
-    "binance": {},
-
-    "okx": {}
-
-}
-
-TRADE_SIZE_USD = 500
-
-# Conservative starting assumption.
-# We will replace this with the real fee tier later.
-BINANCE_FEE = 0.001
-OKX_FEE = 0.001
-
-MIN_NET_EDGE = 0.0005
-
+# ==========================================
+# ARBITRAGE ENGINE
+# ==========================================
 
 def check_arbitrage():
 
     for symbol in SYMBOLS:
 
-        b = prices["binance"].get(symbol)
-        o = prices["okx"].get(symbol)
+        binance_book = books["binance"].get(symbol)
+        okx_book = books["okx"].get(symbol)
 
-        if not b or not o:
+        if not binance_book or not okx_book:
             continue
 
-        # ==========================================
+        # Ignore stale data
+        now = time.time()
+
+        if now - binance_book["timestamp"] > 2:
+            continue
+
+        if now - okx_book["timestamp"] > 2:
+            continue
+
+
+        # ======================================
         # Binance -> OKX
-        # ==========================================
+        # ======================================
 
-        buy_price = b["ask"]
-        sell_price = o["bid"]
+        buy_vwap = calculate_vwap(
+            binance_book["asks"],
+            TRADE_SIZE_USD
+        )
 
-        gross_edge = (sell_price - buy_price) / buy_price
+        sell_vwap = calculate_vwap(
+            okx_book["bids"],
+            TRADE_SIZE_USD
+        )
 
-        fees = BINANCE_FEE + OKX_FEE
+        if buy_vwap and sell_vwap:
 
-        net_edge = gross_edge - fees
+            gross_edge = (
+                sell_vwap - buy_vwap
+            ) / buy_vwap
 
-        expected_profit = TRADE_SIZE_USD * net_edge
-
-        if net_edge >= MIN_NET_EDGE:
-
-            print(
-                f"\n🚨 NET ARBITRAGE {symbol}\n"
-                f"BUY Binance: {buy_price:.4f}\n"
-                f"SELL OKX:   {sell_price:.4f}\n"
-                f"Gross edge: {gross_edge * 100:.3f}%\n"
-                f"Fees:       {fees * 100:.3f}%\n"
-                f"NET EDGE:   {net_edge * 100:.3f}%\n"
-                f"Size:       ${TRADE_SIZE_USD}\n"
-                f"Est. profit: ${expected_profit:.2f}\n"
+            fees = (
+                BINANCE_FEE +
+                OKX_FEE
             )
 
-        # ==========================================
+            net_edge = gross_edge - fees
+
+            expected_profit = (
+                TRADE_SIZE_USD *
+                net_edge
+            )
+
+            if net_edge >= MIN_NET_EDGE:
+
+                print(
+                    f"\n🚨 NET ARBITRAGE\n"
+                    f"{symbol}\n"
+                    f"\n"
+                    f"BUY Binance VWAP: "
+                    f"{buy_vwap:.6f}\n"
+                    f"SELL OKX VWAP:   "
+                    f"{sell_vwap:.6f}\n"
+                    f"\n"
+                    f"Gross: "
+                    f"{gross_edge * 100:.3f}%\n"
+                    f"Fees: "
+                    f"{fees * 100:.3f}%\n"
+                    f"NET: "
+                    f"{net_edge * 100:.3f}%\n"
+                    f"\n"
+                    f"Size: ${TRADE_SIZE_USD}\n"
+                    f"Estimated P&L: "
+                    f"${expected_profit:.2f}\n"
+                )
+
+
+        # ======================================
         # OKX -> Binance
-        # ==========================================
+        # ======================================
 
-        buy_price = o["ask"]
-        sell_price = b["bid"]
+        buy_vwap = calculate_vwap(
+            okx_book["asks"],
+            TRADE_SIZE_USD
+        )
 
-        gross_edge = (sell_price - buy_price) / buy_price
+        sell_vwap = calculate_vwap(
+            binance_book["bids"],
+            TRADE_SIZE_USD
+        )
 
-        fees = OKX_FEE + BINANCE_FEE
+        if buy_vwap and sell_vwap:
 
-        net_edge = gross_edge - fees
+            gross_edge = (
+                sell_vwap - buy_vwap
+            ) / buy_vwap
 
-        expected_profit = TRADE_SIZE_USD * net_edge
-
-        if net_edge >= MIN_NET_EDGE:
-
-            print(
-                f"\n🚨 NET ARBITRAGE {symbol}\n"
-                f"BUY OKX:     {buy_price:.4f}\n"
-                f"SELL Binance: {sell_price:.4f}\n"
-                f"Gross edge: {gross_edge * 100:.3f}%\n"
-                f"Fees:       {fees * 100:.3f}%\n"
-                f"NET EDGE:   {net_edge * 100:.3f}%\n"
-                f"Size:       ${TRADE_SIZE_USD}\n"
-                f"Est. profit: ${expected_profit:.2f}\n"
+            fees = (
+                OKX_FEE +
+                BINANCE_FEE
             )
 
+            net_edge = gross_edge - fees
+
+            expected_profit = (
+                TRADE_SIZE_USD *
+                net_edge
+            )
+
+            if net_edge >= MIN_NET_EDGE:
+
+                print(
+                    f"\n🚨 NET ARBITRAGE\n"
+                    f"{symbol}\n"
+                    f"\n"
+                    f"BUY OKX VWAP:     "
+                    f"{buy_vwap:.6f}\n"
+                    f"SELL Binance VWAP: "
+                    f"{sell_vwap:.6f}\n"
+                    f"\n"
+                    f"Gross: "
+                    f"{gross_edge * 100:.3f}%\n"
+                    f"Fees: "
+                    f"{fees * 100:.3f}%\n"
+                    f"NET: "
+                    f"{net_edge * 100:.3f}%\n"
+                    f"\n"
+                    f"Size: ${TRADE_SIZE_USD}\n"
+                    f"Estimated P&L: "
+                    f"${expected_profit:.2f}\n"
+                )
+
+
+# ==========================================
+# MONITOR
+# ==========================================
 
 async def monitor():
 
@@ -235,19 +371,21 @@ async def monitor():
 
         check_arbitrage()
 
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.25)
+
+
+# ==========================================
+# MAIN
+# ==========================================
 
 async def main():
 
     await asyncio.gather(
-
         binance(),
-
         okx(),
-
         monitor()
-
     )
+
 
 if __name__ == "__main__":
 
