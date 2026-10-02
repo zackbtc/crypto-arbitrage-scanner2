@@ -281,59 +281,80 @@ async def binance_worker():
 
 async def bybit_worker():
     url = "https://api.bybit.com/v5/market/tickers"
-    
+
     while True:
         try:
             print("BYBIT worker running")
-            for symbol in SYMBOLS:
-                params = {
-                    "category": "linear",
-                    "symbol": symbol
-                }
 
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url, params=params, timeout=10) as response:
-    data = await response.json()
+            async with aiohttp.ClientSession() as session:
 
-    if symbol == "BTCUSDT":
-        print("BYBIT RESPONSE:", data)
+                for symbol in SYMBOLS:
 
-                if data.get("retCode") != 0:
-                    continue
+                    params = {
+                        "category": "linear",
+                        "symbol": symbol
+                    }
 
-                result = data.get("result", {})
-                items = result.get("list", [])
+                    async with session.get(
+                        url,
+                        params=params,
+                        timeout=10
+                    ) as response:
 
-                if not items:
-                    continue
+                        data = await response.json()
 
-                item = items[0]
+                        if symbol == "BTCUSDT":
+                            print("BYBIT RESPONSE:", data)
 
-                funding_rate = item.get("fundingRate")
-                next_funding_time = item.get("nextFundingTime")
+                    if data.get("retCode") != 0:
+                        print(
+                            "BYBIT API ERROR:",
+                            data.get("retCode"),
+                            data.get("retMsg")
+                        )
+                        continue
 
-                if funding_rate is None:
-                    continue
+                    result = data.get("result", {})
+                    items = result.get("list", [])
 
-                funding[symbol]["BYBIT"] = float(funding_rate)
+                    if not items:
+                        print("BYBIT NO ITEM:", symbol)
+                        continue
 
-                if next_funding_time:
-                    next_funding[symbol]["BYBIT"] = int(next_funding_time) / 1000
+                    item = items[0]
 
-                # Bybit provides the funding interval for the instrument.
-                interval_hours = item.get("fundingIntervalHour")
+                    funding_rate = item.get("fundingRate")
+                    next_funding_time = item.get("nextFundingTime")
+                    interval_hours = item.get("fundingIntervalHour")
 
-                if interval_hours:
-                    intervals[symbol]["BYBIT"] = float(interval_hours)
-                else:
-                    intervals[symbol]["BYBIT"] = 8.0
+                    if funding_rate is None:
+                        print("BYBIT NO FUNDING:", symbol)
+                        continue
 
-                last_update[symbol]["BYBIT"] = time.time()
+                    funding[symbol]["BYBIT"] = float(funding_rate)
+
+                    if next_funding_time:
+                        next_funding[symbol]["BYBIT"] = (
+                            int(next_funding_time) / 1000
+                        )
+
+                    if interval_hours:
+                        intervals[symbol]["BYBIT"] = float(
+                            interval_hours
+                        )
+                    else:
+                        intervals[symbol]["BYBIT"] = 8.0
+
+                    last_update[symbol]["BYBIT"] = time.time()
 
             await asyncio.sleep(10)
 
         except Exception as e:
-            connection_status["BYBIT"] = f"ERROR: {str(e)[:50]}"
+            connection_status["BYBIT"] = (
+                f"ERROR: {str(e)[:80]}"
+            )
+            print("BYBIT ERROR:", e)
+
             await asyncio.sleep(5)
 
 
