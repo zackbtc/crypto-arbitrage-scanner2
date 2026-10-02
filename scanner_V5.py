@@ -280,155 +280,57 @@ async def binance_worker():
 # ============================================================
 
 async def bybit_worker():
-
-    url = (
-        "wss://stream.bybit.com"
-        "/v5/public/linear"
-    )
-
+    url = "https://api.bybit.com/v5/market/tickers"
+    
     while True:
-
         try:
-
-            print("BYBIT connecting...")
-
-            async with websockets.connect(
-                url,
-                ping_interval=20,
-                ping_timeout=20,
-                close_timeout=5,
-            ) as ws:
-
-                connection_status["BYBIT"] = True
-
-                print("BYBIT connected.")
-
-                subscribe = {
-                    "op": "subscribe",
-                    "args": [
-                        f"tickers.{symbol}"
-                        for symbol in SYMBOLS
-                    ],
+            for symbol in SYMBOLS:
+                params = {
+                    "category": "linear",
+                    "symbol": symbol
                 }
 
-                await ws.send(
-                    json.dumps(subscribe)
-                )
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, params=params, timeout=10) as response:
+                        data = await response.json()
 
-                async for message in ws:
+                if data.get("retCode") != 0:
+                    continue
 
-                    try:
+                result = data.get("result", {})
+                items = result.get("list", [])
 
-                        payload = json.loads(
-                            message
-                        )
+                if not items:
+                    continue
 
-                        topic = payload.get(
-                            "topic",
-                            ""
-                        )
+                item = items[0]
 
-                        if not topic.startswith(
-                            "tickers."
-                        ):
-                            continue
+                funding_rate = item.get("fundingRate")
+                next_funding_time = item.get("nextFundingTime")
 
-                        symbol = topic.replace(
-                            "tickers.",
-                            ""
-                        )
+                if funding_rate is None:
+                    continue
 
-                        if symbol not in SYMBOLS:
-                            continue
+                funding[symbol]["BYBIT"] = float(funding_rate)
 
-                        data = payload.get(
-                            "data"
-                        )
+                if next_funding_time:
+                    next_funding[symbol]["BYBIT"] = int(next_funding_time) / 1000
 
-                        if isinstance(
-                            data,
-                            list
-                        ):
+                # Bybit provides the funding interval for the instrument.
+                interval_hours = item.get("fundingIntervalHour")
 
-                            if not data:
-                                continue
+                if interval_hours:
+                    intervals[symbol]["BYBIT"] = float(interval_hours)
+                else:
+                    intervals[symbol]["BYBIT"] = 8.0
 
-                            data = data[0]
+                last_update[symbol]["BYBIT"] = time.time()
 
-                        if not isinstance(
-                            data,
-                            dict
-                        ):
-                            continue
-
-                        rate = safe_float(
-                            data.get(
-                                "fundingRate"
-                            )
-                        )
-
-                        if rate is None:
-                            continue
-
-                        funding[symbol]["BYBIT"] = rate
-
-                        interval = safe_float(
-                            data.get(
-                                "fundingIntervalHour"
-                            )
-                        )
-
-                        if (
-                            interval is not None
-                            and interval > 0
-                        ):
-
-                            intervals[symbol]["BYBIT"] = (
-                                interval
-                            )
-
-                        else:
-
-                            intervals[symbol]["BYBIT"] = 8.0
-
-                        next_time = data.get(
-                            "nextFundingTime"
-                        )
-
-                        if next_time is not None:
-
-                            try:
-
-                                next_funding[symbol]["BYBIT"] = int(
-                                    next_time
-                                )
-
-                            except (
-                                ValueError,
-                                TypeError
-                            ):
-                                pass
-
-                        last_update[symbol]["BYBIT"] = time.time()
-
-                    except Exception:
-                        continue
+            await asyncio.sleep(10)
 
         except Exception as e:
-
-            connection_status["BYBIT"] = False
-
-            print(
-                "BYBIT error:",
-                type(e).__name__,
-                str(e)
-            )
-
-        print(
-            "BYBIT reconnecting in 5 seconds..."
-        )
-
-        await asyncio.sleep(5)
+            connection_status["BYBIT"] = f"ERROR: {str(e)[:50]}"
+            await asyncio.sleep(5)
 
 
 # ============================================================
