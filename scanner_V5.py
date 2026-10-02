@@ -1,12 +1,14 @@
 import asyncio
 import json
 import time
+import urllib.request
 import websockets
 
 # ============================================================
-# V5.1 FUNDING INTELLIGENCE
+# V5.1.1 FUNDING INTELLIGENCE
+# DATA RELIABILITY VERSION
 # Binance + Bybit + OKX
-# PAPER / PUBLIC DATA ONLY
+# PUBLIC DATA / PAPER ONLY
 # ============================================================
 
 SYMBOLS = [
@@ -25,67 +27,77 @@ OKX_SYMBOLS = {
     "DOGEUSDT": "DOGE-USDT-SWAP",
 }
 
+EXCHANGES = [
+    "BINANCE",
+    "BYBIT",
+    "OKX",
+]
+
+# Data older than this is ignored.
+STALE_SECONDS = 30
+
+# How often the report is printed.
+REPORT_INTERVAL = 15
+
 # ------------------------------------------------------------
-# Shared market data
+# Shared state
 # ------------------------------------------------------------
 
 funding = {
     symbol: {
-        "BINANCE": None,
-        "BYBIT": None,
-        "OKX": None,
+        exchange: None
+        for exchange in EXCHANGES
     }
     for symbol in SYMBOLS
 }
 
 intervals = {
     symbol: {
-        "BINANCE": None,
-        "BYBIT": None,
-        "OKX": None,
+        exchange: None
+        for exchange in EXCHANGES
     }
     for symbol in SYMBOLS
 }
 
 next_funding = {
     symbol: {
-        "BINANCE": None,
-        "BYBIT": None,
-        "OKX": None,
+        exchange: None
+        for exchange in EXCHANGES
     }
     for symbol in SYMBOLS
 }
 
 last_update = {
     symbol: {
-        "BINANCE": 0,
-        "BYBIT": 0,
-        "OKX": 0,
+        exchange: 0.0
+        for exchange in EXCHANGES
     }
     for symbol in SYMBOLS
 }
 
+connection_status = {
+    "BINANCE": False,
+    "BYBIT": False,
+    "OKX": False,
+}
+
 
 # ============================================================
-# Helpers
+# HELPERS
 # ============================================================
 
 def safe_float(value):
     try:
         if value is None:
             return None
+
         return float(value)
+
     except (ValueError, TypeError):
         return None
 
 
 def funding_percent(rate):
-    """
-    Convert decimal funding rate to percentage.
-
-    Example:
-    0.0001 -> 0.01000%
-    """
     if rate is None:
         return None
 
@@ -93,17 +105,10 @@ def funding_percent(rate):
 
 
 def daily_rate(rate, interval_hours):
-    """
-    Simple daily annualization.
+    if rate is None:
+        return None
 
-    rate = funding rate per settlement
-    interval_hours = settlement interval
-
-    Example:
-    0.0001 every 8h
-    => 0.0003 per day
-    """
-    if rate is None or interval_hours is None:
+    if interval_hours is None:
         return None
 
     if interval_hours <= 0:
@@ -113,7 +118,10 @@ def daily_rate(rate, interval_hours):
 
 
 def annualized_rate(rate, interval_hours):
-    daily = daily_rate(rate, interval_hours)
+    daily = daily_rate(
+        rate,
+        interval_hours
+    )
 
     if daily is None:
         return None
@@ -121,18 +129,43 @@ def annualized_rate(rate, interval_hours):
     return daily * 365.0
 
 
-def fmt_percent(value):
-    if value is None:
+def is_fresh(symbol, exchange):
+    timestamp = last_update[symbol][exchange]
+
+    if timestamp <= 0:
+        return False
+
+    age = time.time() - timestamp
+
+    return age <= STALE_SECONDS
+
+
+def format_funding(rate):
+    if rate is None:
         return "NO DATA"
 
-    return f"{value * 100:.5f}%"
+    return f"{rate * 100:10.5f}%"
 
 
-def fmt_apr(value):
-    if value is None:
+def format_apr(rate):
+    if rate is None:
         return "NO DATA"
 
-    return f"{value * 100:.5f}%"
+    return f"{rate * 100:10.5f}%"
+
+
+def format_age(symbol, exchange):
+    timestamp = last_update[symbol][exchange]
+
+    if timestamp <= 0:
+        return "never"
+
+    age = max(
+        0,
+        time.time() - timestamp
+    )
+
+    return f"{age:.1f}s"
 
 
 # ============================================================
@@ -140,39 +173,38 @@ def fmt_apr(value):
 # ============================================================
 
 async def binance_worker():
-    """
-    Binance USD-M Futures funding data.
 
-    Uses the public REST premiumIndex endpoint instead
-    of the WebSocket funding stream.
-    """
-
-    import urllib.request
-
-    url = "https://fapi.binance.com/fapi/v1/premiumIndex"
+    url = (
+        "https://fapi.binance.com"
+        "/fapi/v1/premiumIndex"
+    )
 
     while True:
 
         try:
+
             request = urllib.request.Request(
                 url,
                 headers={
                     "User-Agent": "Mozilla/5.0"
-                }
+                },
             )
 
             with urllib.request.urlopen(
                 request,
-                timeout=10
+                timeout=10,
             ) as response:
 
-                raw_data = response.read().decode("utf-8")
-                data = json.loads(raw_data)
+                raw = response.read().decode(
+                    "utf-8"
+                )
+
+                data = json.loads(raw)
 
             if not isinstance(data, list):
-                print("BINANCE unexpected response")
-                await asyncio.sleep(10)
-                continue
+                raise ValueError(
+                    "Unexpected Binance response"
+                )
 
             received = 0
 
@@ -181,13 +213,17 @@ async def binance_worker():
                 if not isinstance(item, dict):
                     continue
 
-                symbol = item.get("symbol")
+                symbol = item.get(
+                    "symbol"
+                )
 
                 if symbol not in SYMBOLS:
                     continue
 
                 rate = safe_float(
-                    item.get("lastFundingRate")
+                    item.get(
+                        "lastFundingRate"
+                    )
                 )
 
                 if rate is None:
@@ -195,9 +231,7 @@ async def binance_worker():
 
                 funding[symbol]["BINANCE"] = rate
 
-                # Initial research assumption.
-                # We will verify instrument-specific intervals
-                # in a later step.
+                # Temporary research assumption.
                 intervals[symbol]["BINANCE"] = 8.0
 
                 next_time = item.get(
@@ -205,16 +239,23 @@ async def binance_worker():
                 )
 
                 if next_time is not None:
+
                     try:
+
                         next_funding[symbol]["BINANCE"] = int(
                             next_time
                         )
-                    except Exception:
+
+                    except (ValueError, TypeError):
                         pass
 
                 last_update[symbol]["BINANCE"] = time.time()
 
                 received += 1
+
+            connection_status["BINANCE"] = (
+                received > 0
+            )
 
             print(
                 f"BINANCE funding updated: "
@@ -223,9 +264,12 @@ async def binance_worker():
 
         except Exception as e:
 
+            connection_status["BINANCE"] = False
+
             print(
-                f"BINANCE REST error: "
-                f"{type(e).__name__}: {e}"
+                "BINANCE error:",
+                type(e).__name__,
+                str(e)
             )
 
         await asyncio.sleep(10)
@@ -236,25 +280,16 @@ async def binance_worker():
 # ============================================================
 
 async def bybit_worker():
-    """
-    Bybit V5 linear perpetual ticker.
 
-    Topic:
-    tickers.BTCUSDT
-
-    Important fields:
-    fundingRate
-    fundingIntervalHour
-    nextFundingTime
-    markPrice
-    indexPrice
-    """
-
-    url = "wss://stream.bybit.com/v5/public/linear"
+    url = (
+        "wss://stream.bybit.com"
+        "/v5/public/linear"
+    )
 
     while True:
 
         try:
+
             print("BYBIT connecting...")
 
             async with websockets.connect(
@@ -264,9 +299,11 @@ async def bybit_worker():
                 close_timeout=5,
             ) as ws:
 
+                connection_status["BYBIT"] = True
+
                 print("BYBIT connected.")
 
-                subscribe_message = {
+                subscribe = {
                     "op": "subscribe",
                     "args": [
                         f"tickers.{symbol}"
@@ -275,17 +312,25 @@ async def bybit_worker():
                 }
 
                 await ws.send(
-                    json.dumps(subscribe_message)
+                    json.dumps(subscribe)
                 )
 
                 async for message in ws:
 
                     try:
-                        payload = json.loads(message)
 
-                        topic = payload.get("topic", "")
+                        payload = json.loads(
+                            message
+                        )
 
-                        if not topic.startswith("tickers."):
+                        topic = payload.get(
+                            "topic",
+                            ""
+                        )
+
+                        if not topic.startswith(
+                            "tickers."
+                        ):
                             continue
 
                         symbol = topic.replace(
@@ -296,46 +341,72 @@ async def bybit_worker():
                         if symbol not in SYMBOLS:
                             continue
 
-                        data = payload.get("data")
+                        data = payload.get(
+                            "data"
+                        )
 
-                        if isinstance(data, list):
+                        if isinstance(
+                            data,
+                            list
+                        ):
+
                             if not data:
                                 continue
+
                             data = data[0]
 
-                        if not isinstance(data, dict):
+                        if not isinstance(
+                            data,
+                            dict
+                        ):
                             continue
 
                         rate = safe_float(
-                            data.get("fundingRate")
+                            data.get(
+                                "fundingRate"
+                            )
                         )
 
-                        interval = safe_float(
-                            data.get("fundingIntervalHour")
-                        )
-
-                        next_time = data.get(
-                            "nextFundingTime"
-                        )
-
-                        # We specifically require a real
-                        # fundingRate field.
                         if rate is None:
                             continue
 
                         funding[symbol]["BYBIT"] = rate
 
-                        if interval is not None and interval > 0:
-                            intervals[symbol]["BYBIT"] = interval
+                        interval = safe_float(
+                            data.get(
+                                "fundingIntervalHour"
+                            )
+                        )
+
+                        if (
+                            interval is not None
+                            and interval > 0
+                        ):
+
+                            intervals[symbol]["BYBIT"] = (
+                                interval
+                            )
+
                         else:
+
                             intervals[symbol]["BYBIT"] = 8.0
 
+                        next_time = data.get(
+                            "nextFundingTime"
+                        )
+
                         if next_time is not None:
+
                             try:
+
                                 next_funding[symbol]["BYBIT"] = int(
                                     next_time
                                 )
-                            except Exception:
+
+                            except (
+                                ValueError,
+                                TypeError
+                            ):
                                 pass
 
                         last_update[symbol]["BYBIT"] = time.time()
@@ -344,11 +415,19 @@ async def bybit_worker():
                         continue
 
         except Exception as e:
+
+            connection_status["BYBIT"] = False
+
             print(
-                f"BYBIT connection error: {type(e).__name__}"
+                "BYBIT error:",
+                type(e).__name__,
+                str(e)
             )
 
-        print("BYBIT reconnecting in 5 seconds...")
+        print(
+            "BYBIT reconnecting in 5 seconds..."
+        )
+
         await asyncio.sleep(5)
 
 
@@ -357,15 +436,16 @@ async def bybit_worker():
 # ============================================================
 
 async def okx_worker():
-    """
-    OKX public funding-rate channel.
-    """
 
-    url = "wss://ws.okx.com/ws/v5/public"
+    url = (
+        "wss://ws.okx.com"
+        "/ws/v5/public"
+    )
 
     while True:
 
         try:
+
             print("OKX connecting...")
 
             async with websockets.connect(
@@ -375,56 +455,84 @@ async def okx_worker():
                 close_timeout=5,
             ) as ws:
 
+                connection_status["OKX"] = True
+
                 print("OKX connected.")
 
                 args = []
 
                 for symbol in SYMBOLS:
-                    args.append({
-                        "channel": "funding-rate",
-                        "instId": OKX_SYMBOLS[symbol],
-                    })
 
-                subscribe_message = {
+                    args.append(
+                        {
+                            "channel": "funding-rate",
+                            "instId": OKX_SYMBOLS[symbol],
+                        }
+                    )
+
+                subscribe = {
                     "op": "subscribe",
                     "args": args,
                 }
 
                 await ws.send(
-                    json.dumps(subscribe_message)
+                    json.dumps(subscribe)
                 )
 
                 async for message in ws:
 
                     try:
-                        payload = json.loads(message)
 
-                        if payload.get("event") in (
+                        payload = json.loads(
+                            message
+                        )
+
+                        if payload.get(
+                            "event"
+                        ) in (
                             "subscribe",
                             "error",
                         ):
                             continue
 
-                        arg = payload.get("arg", {})
+                        arg = payload.get(
+                            "arg",
+                            {}
+                        )
 
-                        inst_id = arg.get("instId")
+                        inst_id = arg.get(
+                            "instId"
+                        )
 
                         if not inst_id:
                             continue
 
                         symbol = None
 
-                        for local_symbol, okx_symbol in OKX_SYMBOLS.items():
-                            if okx_symbol == inst_id:
+                        for (
+                            local_symbol,
+                            okx_symbol,
+                        ) in OKX_SYMBOLS.items():
+
+                            if (
+                                okx_symbol
+                                == inst_id
+                            ):
+
                                 symbol = local_symbol
                                 break
 
                         if symbol is None:
                             continue
 
-                        data_list = payload.get("data")
+                        data_list = payload.get(
+                            "data"
+                        )
 
-                        if not isinstance(data_list, list):
+                        if not isinstance(
+                            data_list,
+                            list
+                        ):
                             continue
 
                         if not data_list:
@@ -432,8 +540,16 @@ async def okx_worker():
 
                         data = data_list[0]
 
+                        if not isinstance(
+                            data,
+                            dict
+                        ):
+                            continue
+
                         rate = safe_float(
-                            data.get("fundingRate")
+                            data.get(
+                                "fundingRate"
+                            )
                         )
 
                         if rate is None:
@@ -441,9 +557,7 @@ async def okx_worker():
 
                         funding[symbol]["OKX"] = rate
 
-                        # Initial research assumption.
-                        # We will later verify OKX intervals
-                        # instrument by instrument.
+                        # Temporary research assumption.
                         intervals[symbol]["OKX"] = 8.0
 
                         next_time = data.get(
@@ -451,11 +565,17 @@ async def okx_worker():
                         )
 
                         if next_time is not None:
+
                             try:
+
                                 next_funding[symbol]["OKX"] = int(
                                     next_time
                                 )
-                            except Exception:
+
+                            except (
+                                ValueError,
+                                TypeError
+                            ):
                                 pass
 
                         last_update[symbol]["OKX"] = time.time()
@@ -464,35 +584,77 @@ async def okx_worker():
                         continue
 
         except Exception as e:
+
+            connection_status["OKX"] = False
+
             print(
-                f"OKX connection error: {type(e).__name__}"
+                "OKX error:",
+                type(e).__name__,
+                str(e)
             )
 
-        print("OKX reconnecting in 5 seconds...")
+        print(
+            "OKX reconnecting in 5 seconds..."
+        )
+
         await asyncio.sleep(5)
 
 
 # ============================================================
-# REPORT
+# DATA STATUS
 # ============================================================
 
-def exchange_status(symbol, exchange):
-    updated = last_update[symbol][exchange]
+def print_data_status():
 
-    if updated == 0:
-        return False
+    print(
+        "DATA STATUS"
+    )
 
-    # Data older than 30 seconds is considered stale.
-    return (time.time() - updated) <= 30
+    for exchange in EXCHANGES:
 
+        connected = connection_status[
+            exchange
+        ]
+
+        fresh_count = sum(
+            1
+            for symbol in SYMBOLS
+            if is_fresh(
+                symbol,
+                exchange
+            )
+        )
+
+        mark = "OK" if connected else "OFF"
+
+        print(
+            f"{exchange:<8} "
+            f"{mark:<3} "
+            f"{fresh_count}/{len(SYMBOLS)} fresh"
+        )
+
+
+# ============================================================
+# BEST SPREAD
+# ============================================================
 
 def calculate_best_spread(symbol):
+
     valid = []
 
-    for exchange in ["BINANCE", "BYBIT", "OKX"]:
+    for exchange in EXCHANGES:
+
+        if not is_fresh(
+            symbol,
+            exchange
+        ):
+            continue
 
         rate = funding[symbol][exchange]
-        interval = intervals[symbol][exchange]
+
+        interval = intervals[
+            symbol
+        ][exchange]
 
         if rate is None:
             continue
@@ -500,11 +662,12 @@ def calculate_best_spread(symbol):
         if interval is None:
             continue
 
-        if not exchange_status(symbol, exchange):
-            continue
-
         valid.append(
-            (exchange, rate, interval)
+            (
+                exchange,
+                rate,
+                interval,
+            )
         )
 
     if len(valid) < 2:
@@ -512,148 +675,248 @@ def calculate_best_spread(symbol):
 
     best = None
 
-    for short_exchange, short_rate, short_interval in valid:
+    for (
+        exchange_a,
+        rate_a,
+        interval_a,
+    ) in valid:
 
-        for long_exchange, long_rate, long_interval in valid:
+        for (
+            exchange_b,
+            rate_b,
+            interval_b,
+        ) in valid:
 
-            if short_exchange == long_exchange:
+            if exchange_a == exchange_b:
                 continue
 
-            # We want to receive more funding from the
-            # short side than we pay on the long side.
-            #
-            # Simple daily comparison.
-            short_daily = daily_rate(
-                short_rate,
-                short_interval
+            daily_a = daily_rate(
+                rate_a,
+                interval_a
             )
 
-            long_daily = daily_rate(
-                long_rate,
-                long_interval
+            daily_b = daily_rate(
+                rate_b,
+                interval_b
             )
 
-            if short_daily is None or long_daily is None:
+            if (
+                daily_a is None
+                or daily_b is None
+            ):
                 continue
 
-            spread = short_daily - long_daily
+            spread = daily_a - daily_b
 
             if spread <= 0:
                 continue
 
             candidate = {
-                "short_exchange": short_exchange,
-                "long_exchange": long_exchange,
+                "high_exchange": exchange_a,
+                "low_exchange": exchange_b,
                 "spread": spread,
                 "annualized": spread * 365.0,
             }
 
-            if best is None:
-                best = candidate
-            elif spread > best["spread"]:
+            if (
+                best is None
+                or spread > best["spread"]
+            ):
+
                 best = candidate
 
     return best
 
 
-def print_report():
-
-    print()
-    print("=" * 70)
-    print("V5.1 FUNDING INTELLIGENCE")
-    print("=" * 70)
-
-    for symbol in SYMBOLS:
-
-        print(symbol)
-
-        for exchange in ["BINANCE", "BYBIT", "OKX"]:
-
-            rate = funding[symbol][exchange]
-            interval = intervals[symbol][exchange]
-
-            if (
-                rate is None
-                or interval is None
-                or not exchange_status(symbol, exchange)
-            ):
-                print(
-                    f"{exchange:<8} NO DATA"
-                )
-                continue
-
-            daily = daily_rate(
-                rate,
-                interval
-            )
-
-            annual = annualized_rate(
-                rate,
-                interval
-            )
-
-            print(
-                f"{exchange:<8}"
-                f"Funding: {funding_percent(rate):>10.5f}% "
-                f"Daily: {funding_percent(daily):>10.5f}% "
-                f"APR*: {fmt_apr(annual):>10}"
-            )
-
-        best = calculate_best_spread(symbol)
-
-        if best is None:
-
-            print(
-                "BEST FUNDING SPREAD: "
-                "NOT ENOUGH VALID DATA"
-            )
-
-        else:
-
-            print("BEST FUNDING SPREAD:")
-
-            print(
-                f"SHORT {best['short_exchange']} | "
-                f"LONG {best['long_exchange']}"
-            )
-
-            print(
-                "Daily funding advantage: "
-                f"{funding_percent(best['spread']):.5f}%"
-            )
-
-            print(
-                "Approx annualized: "
-                f"{best['annualized'] * 100:.5f}%"
-            )
-
-        print()
-
-    print("-" * 70)
-    print(
-        "* APR = simple annualization of the current "
-        "funding rate."
-    )
-    print(
-        "* It is NOT a guaranteed return."
-    )
-    print(
-        "* No trades are executed."
-    )
-    print("=" * 70)
-
-
 # ============================================================
-# REPORT LOOP
+# REPORT
 # ============================================================
 
 async def report_loop():
 
     while True:
 
-        await asyncio.sleep(15)
+        await asyncio.sleep(
+            REPORT_INTERVAL
+        )
 
-        print_report()
+        # Build the entire report first.
+        # This prevents multiple workers from
+        # interleaving the report output.
+
+        lines = []
+
+        lines.append("")
+        lines.append(
+            "=" * 70
+        )
+        lines.append(
+            "V5.1.1 FUNDING INTELLIGENCE"
+        )
+        lines.append(
+            "=" * 70
+        )
+
+        # Data status
+
+        lines.append(
+            "DATA STATUS"
+        )
+
+        for exchange in EXCHANGES:
+
+            connected = connection_status[
+                exchange
+            ]
+
+            fresh_count = sum(
+                1
+                for symbol in SYMBOLS
+                if is_fresh(
+                    symbol,
+                    exchange
+                )
+            )
+
+            status = "OK" if connected else "OFF"
+
+            lines.append(
+                f"{exchange:<8} "
+                f"{status:<3} "
+                f"{fresh_count}/{len(SYMBOLS)} fresh"
+            )
+
+        lines.append(
+            "-" * 70
+        )
+
+        # Symbol reports
+
+        for symbol in SYMBOLS:
+
+            lines.append(
+                symbol
+            )
+
+            for exchange in EXCHANGES:
+
+                rate = funding[
+                    symbol
+                ][exchange]
+
+                interval = intervals[
+                    symbol
+                ][exchange]
+
+                fresh = is_fresh(
+                    symbol,
+                    exchange
+                )
+
+                if (
+                    not fresh
+                    or rate is None
+                    or interval is None
+                ):
+
+                    age = format_age(
+                        symbol,
+                        exchange
+                    )
+
+                    lines.append(
+                        f"{exchange:<8} "
+                        f"NO DATA "
+                        f"(age {age})"
+                    )
+
+                    continue
+
+                daily = daily_rate(
+                    rate,
+                    interval
+                )
+
+                annual = annualized_rate(
+                    rate,
+                    interval
+                )
+
+                lines.append(
+                    f"{exchange:<8} "
+                    f"Funding: "
+                    f"{format_funding(rate)} "
+                    f"Daily: "
+                    f"{format_funding(daily)} "
+                    f"APR*: "
+                    f"{format_apr(annual)} "
+                    f"Age: "
+                    f"{format_age(symbol, exchange)}"
+                )
+
+            best = calculate_best_spread(
+                symbol
+            )
+
+            if best is None:
+
+                lines.append(
+                    "BEST FUNDING SPREAD: "
+                    "NOT ENOUGH FRESH DATA"
+                )
+
+            else:
+
+                lines.append(
+                    "BEST FUNDING SPREAD:"
+                )
+
+                lines.append(
+                    f"HIGH FUNDING: "
+                    f"{best['high_exchange']}"
+                )
+
+                lines.append(
+                    f"LOW FUNDING : "
+                    f"{best['low_exchange']}"
+                )
+
+                lines.append(
+                    "Daily funding difference: "
+                    f"{best['spread'] * 100:.5f}%"
+                )
+
+                lines.append(
+                    "Approx annualized: "
+                    f"{best['annualized'] * 100:.5f}%"
+                )
+
+            lines.append("")
+
+        lines.append(
+            "-" * 70
+        )
+
+        lines.append(
+            "* APR = simple annualization "
+            "of the current funding rate."
+        )
+
+        lines.append(
+            "* It is NOT a guaranteed return."
+        )
+
+        lines.append(
+            "* No trades are executed."
+        )
+
+        lines.append(
+            "=" * 70
+        )
+
+        print(
+            "\n".join(lines)
+        )
 
 
 # ============================================================
@@ -662,10 +925,21 @@ async def report_loop():
 
 async def main():
 
-    print("=" * 70)
-    print("V5.1 FUNDING INTELLIGENCE STARTING")
-    print("PUBLIC DATA / PAPER ONLY")
-    print("=" * 70)
+    print(
+        "=" * 70
+    )
+
+    print(
+        "V5.1.1 FUNDING INTELLIGENCE STARTING"
+    )
+
+    print(
+        "PUBLIC DATA / PAPER ONLY"
+    )
+
+    print(
+        "=" * 70
+    )
 
     await asyncio.gather(
         binance_worker(),
@@ -676,7 +950,13 @@ async def main():
 
 
 if __name__ == "__main__":
+
     try:
+
         asyncio.run(main())
+
     except KeyboardInterrupt:
-        print("Stopped.")
+
+        print(
+            "Stopped."
+        )
