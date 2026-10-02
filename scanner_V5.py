@@ -3,6 +3,7 @@ import json
 import time
 import urllib.request
 import websockets
+import aiohttp
 
 # ============================================================
 # V5.1.1 FUNDING INTELLIGENCE
