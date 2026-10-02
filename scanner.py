@@ -2,9 +2,12 @@ import asyncio
 import json
 import time
 import websockets
+
+
 # =========================
 # CONFIG
 # =========================
+
 SYMBOLS = [
     "BTCUSDT",
     "ETHUSDT",
@@ -12,31 +15,43 @@ SYMBOLS = [
     "XRPUSDT",
     "DOGEUSDT",
 ]
-TRADE_SIZE_USD = 500
-# Temporary fee assumptions.
-# We will replace these with the real fee tiers later.
+
+TRADE_SIZE_USD = 500.0
+
+# Temporary assumptions for research
 BINANCE_FEE = 0.001
 OKX_FEE = 0.001
 BYBIT_FEE = 0.001
-# Opportunity threshold
-MIN_NET_EDGE = 0.0005
-# Data is considered stale after this many seconds
-STALE_SECONDS = 2
-# Market report interval
+
+NET_THRESHOLD = 0.0005
+STALE_SECONDS = 2.0
+
 REPORT_INTERVAL = 30
-BINANCE_URL = "wss://stream.binance.com:9443/stream"
-OKX_URL = "wss://ws.okx.com/ws/v5/public"
-BYBIT_URL = "wss://stream.bybit.com/v5/public/spot"
+
+
 # =========================
 # ORDER BOOK STORAGE
 # =========================
+
 books = {
     "binance": {},
     "okx": {},
     "bybit": {},
 }
-# Opportunity counters
-opportunity_counts = {
+
+
+last_update = {
+    "binance": {},
+    "okx": {},
+    "bybit": {},
+}
+
+
+# =========================
+# STATISTICS
+# =========================
+
+stats = {
     "binance_okx": 0,
     "okx_binance": 0,
     "binance_bybit": 0,
@@ -44,309 +59,415 @@ opportunity_counts = {
     "okx_bybit": 0,
     "bybit_okx": 0,
 }
+
+
+best_gross = {
+    "value": -999,
+    "route": None,
+    "symbol": None,
+}
+
+best_net = {
+    "value": -999,
+    "route": None,
+    "symbol": None,
+    "pnl": None,
+}
+
+
 # =========================
 # VWAP
 # =========================
+
 def calculate_vwap(levels, usd_size):
+
     remaining_usd = usd_size
     total_base = 0.0
     total_usd = 0.0
+
     for level in levels:
-        # OKX sends:
-        # [price, quantity, ...]
-        # Binance/Bybit send:
-        # [price, quantity]
+
         if len(level) < 2:
             continue
+
         price = float(level[0])
         quantity = float(level[1])
+
         if price <= 0 or quantity <= 0:
             continue
+
         level_usd = price * quantity
+
         take_usd = min(
             remaining_usd,
             level_usd
         )
+
         if take_usd <= 0:
             continue
+
         base_amount = take_usd / price
+
         total_base += base_amount
         total_usd += take_usd
+
         remaining_usd -= take_usd
+
         if remaining_usd <= 0:
             break
-    if total_base == 0:
+
+    if total_base <= 0:
         return None
-    # Not enough liquidity for the requested trade size
+
     if remaining_usd > 0:
         return None
+
     return total_usd / total_base
+
+
+# =========================
+# NET EDGE
+# =========================
+
+def calculate_net_edge(
+    buy_price,
+    sell_price,
+    buy_fee,
+    sell_fee
+):
+
+    gross = (sell_price - buy_price) / buy_price
+
+    net = gross - buy_fee - sell_fee
+
+    return gross, net
+
+
 # =========================
 # BINANCE
 # =========================
-async def binance():
-    streams = [
-        f"{symbol.lower()}@depth20@100ms"
+
+async def binance_stream():
+
+    streams = "/".join(
+        symbol.lower() + "@depth20@100ms"
         for symbol in SYMBOLS
-    ]
-    params = {
-        "method": "SUBSCRIBE",
-        "params": streams,
-        "id": 1
-    }
+    )
+
+    url = (
+        "wss://stream.binance.com:9443/stream?streams="
+        + streams
+    )
+
     while True:
+
         try:
-            print("Connecting to Binance...")
+
             async with websockets.connect(
-                BINANCE_URL,
+                url,
                 ping_interval=20,
                 ping_timeout=20
             ) as ws:
-                await ws.send(json.dumps(params))
-                print("Binance connected.")
+
                 async for message in ws:
+
                     data = json.loads(message)
-                    # Ignore subscription response
-                    if "data" not in data:
-                        continue
-                    payload = data["data"]
-                    # Combined stream contains:
-                    # "stream": "btcusdt@depth20@100ms"
+
                     stream_name = data.get("stream")
+
+                    payload = data.get("data", {})
+
                     if not stream_name:
                         continue
-                    # Extract symbol from stream name
+
                     symbol = stream_name.split("@")[0].upper()
-                    if symbol not in SYMBOLS:
-                        continue
+
                     bids = payload.get("bids", [])
                     asks = payload.get("asks", [])
+
                     if not bids or not asks:
                         continue
+
                     books["binance"][symbol] = {
                         "bids": bids,
                         "asks": asks,
-                        "timestamp": time.time()
                     }
+
+                    last_update["binance"][symbol] = time.time()
+
         except Exception as e:
-            print("Binance connection error:", e)
+
+            print(
+                "Binance error:",
+                e
+            )
+
             await asyncio.sleep(3)
+
+
 # =========================
 # OKX
 # =========================
-async def okx():
+
+async def okx_stream():
+
+    url = "wss://ws.okx.com/ws/v5/public"
+
     while True:
+
         try:
-            print("Connecting to OKX...")
+
             async with websockets.connect(
-                OKX_URL,
+                url,
                 ping_interval=20,
                 ping_timeout=20
             ) as ws:
-                args = [
-                    {
+
+                args = []
+
+                for symbol in SYMBOLS:
+
+                    base = symbol.replace(
+                        "USDT",
+                        "-USDT"
+                    )
+
+                    args.append({
                         "channel": "books5",
-                        "instId": symbol.replace("USDT", "-USDT")
-                    }
-                    for symbol in SYMBOLS
-                ]
-                subscribe = {
-                    "op": "subscribe",
-                    "args": args
-                }
-                await ws.send(json.dumps(subscribe))
-                print("OKX connected.")
+                        "instId": base
+                    })
+
+                await ws.send(
+                    json.dumps({
+                        "op": "subscribe",
+                        "args": args
+                    })
+                )
+
                 async for message in ws:
-                    if message == "pong":
-                        continue
+
                     data = json.loads(message)
-                    if "data" not in data:
+
+                    if data.get("event") == "subscribe":
                         continue
-                    if not data["data"]:
+
+                    arg = data.get("arg", {})
+
+                    inst_id = arg.get("instId")
+
+                    if not inst_id:
                         continue
-                    book = data["data"][0]
+
+                    symbol = inst_id.replace(
+                        "-",
+                        ""
+                    )
+
+                    payload = data.get("data")
+
+                    if not payload:
+                        continue
+
+                    book = payload[0]
+
                     bids = book.get("bids", [])
                     asks = book.get("asks", [])
+
                     if not bids or not asks:
                         continue
-                    inst_id = data["arg"]["instId"]
-                    symbol = inst_id.replace("-", "")
+
                     books["okx"][symbol] = {
                         "bids": bids,
                         "asks": asks,
-                        "timestamp": time.time()
                     }
+
+                    last_update["okx"][symbol] = time.time()
+
         except Exception as e:
-            print("OKX connection error:", e)
+
+            print(
+                "OKX error:",
+                e
+            )
+
             await asyncio.sleep(3)
+
+
 # =========================
 # BYBIT
 # =========================
-async def bybit():
+
+async def bybit_stream():
+
+    url = "wss://stream.bybit.com/v5/public/spot"
+
     while True:
+
         try:
-            print("Connecting to Bybit...")
+
             async with websockets.connect(
-                BYBIT_URL,
+                url,
                 ping_interval=20,
                 ping_timeout=20
             ) as ws:
-                topics = [
-                    f"orderbook.50.{symbol}"
+
+                args = [
+                    "orderbook.50." + symbol
                     for symbol in SYMBOLS
                 ]
-                subscribe = {
-                    "op": "subscribe",
-                    "args": topics
-                }
-                await ws.send(json.dumps(subscribe))
-                print("Bybit connected.")
-                # Local order books
-                local_books = {
-                    symbol: {
-                        "bids": {},
-                        "asks": {},
-                        "timestamp": 0
-                    }
-                    for symbol in SYMBOLS
-                }
+
+                await ws.send(
+                    json.dumps({
+                        "op": "subscribe",
+                        "args": args
+                    })
+                )
+
                 async for message in ws:
+
                     data = json.loads(message)
-                    if data.get("op") == "pong":
-                        continue
+
                     topic = data.get("topic", "")
-                    if not topic.startswith("orderbook.50."):
+
+                    if not topic.startswith(
+                        "orderbook."
+                    ):
                         continue
+
                     symbol = topic.split(".")[-1]
-                    if symbol not in SYMBOLS:
-                        continue
-                    msg_type = data.get("type")
+
                     payload = data.get("data", {})
+
                     bids = payload.get("b", [])
                     asks = payload.get("a", [])
-                    # -------------------------
-                    # SNAPSHOT
-                    # -------------------------
-                    if msg_type == "snapshot":
-                        local_books[symbol]["bids"] = {
-                            float(price): float(qty)
-                            for price, qty in bids
-                            if float(qty) > 0
-                        }
-                        local_books[symbol]["asks"] = {
-                            float(price): float(qty)
-                            for price, qty in asks
-                            if float(qty) > 0
-                        }
-                    # -------------------------
-                    # DELTA
-                    # -------------------------
-                    elif msg_type == "delta":
-                        for price, qty in bids:
-                            price = float(price)
-                            qty = float(qty)
-                            if qty == 0:
-                                local_books[symbol]["bids"].pop(
-                                    price,
-                                    None
-                                )
-                            else:
-                                local_books[symbol]["bids"][price] = qty
-                        for price, qty in asks:
-                            price = float(price)
-                            qty = float(qty)
-                            if qty == 0:
-                                local_books[symbol]["asks"].pop(
-                                    price,
-                                    None
-                                )
-                            else:
-                                local_books[symbol]["asks"][price] = qty
-                    else:
+
+                    if not bids or not asks:
                         continue
-                    # Sort local order book
-                    sorted_bids = sorted(
-                        local_books[symbol]["bids"].items(),
-                        key=lambda x: x[0],
-                        reverse=True
-                    )[:50]
-                    sorted_asks = sorted(
-                        local_books[symbol]["asks"].items(),
-                        key=lambda x: x[0]
-                    )[:50]
-                    if not sorted_bids or not sorted_asks:
-                        continue
-                    local_books[symbol]["timestamp"] = time.time()
+
                     books["bybit"][symbol] = {
-                        "bids": sorted_bids,
-                        "asks": sorted_asks,
-                        "timestamp": local_books[symbol]["timestamp"]
+                        "bids": bids,
+                        "asks": asks,
                     }
+
+                    last_update["bybit"][symbol] = time.time()
+
         except Exception as e:
-            print("Bybit connection error:", e)
+
+            print(
+                "Bybit error:",
+                e
+            )
+
             await asyncio.sleep(3)
+
+
 # =========================
-# ARBITRAGE CALCULATION
+# FRESHNESS
 # =========================
-def evaluate_pair(
-    buy_exchange,
-    sell_exchange,
-    symbol,
-    fee_buy,
-    fee_sell,
-    counter_name
-):
-    buy_book = books[buy_exchange].get(symbol)
-    sell_book = books[sell_exchange].get(symbol)
-    if not buy_book or not sell_book:
-        return None
-    now = time.time()
-    if now - buy_book["timestamp"] > STALE_SECONDS:
-        return None
-    if now - sell_book["timestamp"] > STALE_SECONDS:
-        return None
-    buy_vwap = calculate_vwap(
-        buy_book["asks"],
-        TRADE_SIZE_USD
+
+def is_fresh(exchange, symbol):
+
+    timestamp = last_update[
+        exchange
+    ].get(symbol)
+
+    if timestamp is None:
+        return False
+
+    return (
+        time.time() - timestamp
+        <= STALE_SECONDS
     )
-    sell_vwap = calculate_vwap(
-        sell_book["bids"],
-        TRADE_SIZE_USD
-    )
-    if not buy_vwap or not sell_vwap:
-        return None
-    gross_edge = (
-        sell_vwap - buy_vwap
-    ) / buy_vwap
-    fees = fee_buy + fee_sell
-    net_edge = gross_edge - fees
-    expected_profit = TRADE_SIZE_USD * net_edge
-    if net_edge >= MIN_NET_EDGE:
-        opportunity_counts[counter_name] += 1
-        print(
-            f"\n🚨 NET ARBITRAGE\n"
-            f"{symbol}\n"
-            f"BUY  {buy_exchange.upper()}: "
-            f"${buy_vwap:.6f}\n"
-            f"SELL {sell_exchange.upper()}: "
-            f"${sell_vwap:.6f}\n"
-            f"\nGross: {gross_edge * 100:.3f}%"
-            f"\nFees:  {fees * 100:.3f}%"
-            f"\nNET:   {net_edge * 100:.3f}%"
-            f"\n\nSize: ${TRADE_SIZE_USD}"
-            f"\nEstimated P&L: ${expected_profit:.2f}\n"
-        )
-    return {
-        "gross": gross_edge,
-        "net": net_edge,
-        "profit": expected_profit
-    }
+
+
 # =========================
 # MARKET CHECK
 # =========================
-def check_all_markets():
+
+def check_route(
+    buy_exchange,
+    sell_exchange,
+    symbol,
+    buy_fee,
+    sell_fee,
+    route_name
+):
+
+    if not is_fresh(
+        buy_exchange,
+        symbol
+    ):
+        return
+
+    if not is_fresh(
+        sell_exchange,
+        symbol
+    ):
+        return
+
+    buy_book = books[
+        buy_exchange
+    ].get(symbol)
+
+    sell_book = books[
+        sell_exchange
+    ].get(symbol)
+
+    if not buy_book or not sell_book:
+        return
+
+    buy_price = calculate_vwap(
+        buy_book["asks"],
+        TRADE_SIZE_USD
+    )
+
+    sell_price = calculate_vwap(
+        sell_book["bids"],
+        TRADE_SIZE_USD
+    )
+
+    if buy_price is None or sell_price is None:
+        return
+
+    gross, net = calculate_net_edge(
+        buy_price,
+        sell_price,
+        buy_fee,
+        sell_fee
+    )
+
+    # Track best gross
+    if gross > best_gross["value"]:
+
+        best_gross["value"] = gross
+        best_gross["route"] = route_name
+        best_gross["symbol"] = symbol
+
+    # Track positive net observations
+    if net > 0:
+
+        stats[route_name] += 1
+
+    # Track best net
+    if net > best_net["value"]:
+
+        pnl = TRADE_SIZE_USD * net
+
+        best_net["value"] = net
+        best_net["route"] = route_name
+        best_net["symbol"] = symbol
+        best_net["pnl"] = pnl
+
+
+# =========================
+# RUN ALL CHECKS
+# =========================
+
+def run_checks():
+
     for symbol in SYMBOLS:
-        evaluate_pair(
+
+        check_route(
             "binance",
             "okx",
             symbol,
@@ -354,7 +475,8 @@ def check_all_markets():
             OKX_FEE,
             "binance_okx"
         )
-        evaluate_pair(
+
+        check_route(
             "okx",
             "binance",
             symbol,
@@ -362,7 +484,8 @@ def check_all_markets():
             BINANCE_FEE,
             "okx_binance"
         )
-        evaluate_pair(
+
+        check_route(
             "binance",
             "bybit",
             symbol,
@@ -370,7 +493,8 @@ def check_all_markets():
             BYBIT_FEE,
             "binance_bybit"
         )
-        evaluate_pair(
+
+        check_route(
             "bybit",
             "binance",
             symbol,
@@ -378,7 +502,8 @@ def check_all_markets():
             BINANCE_FEE,
             "bybit_binance"
         )
-        evaluate_pair(
+
+        check_route(
             "okx",
             "bybit",
             symbol,
@@ -386,7 +511,8 @@ def check_all_markets():
             BYBIT_FEE,
             "okx_bybit"
         )
-        evaluate_pair(
+
+        check_route(
             "bybit",
             "okx",
             symbol,
@@ -394,54 +520,135 @@ def check_all_markets():
             OKX_FEE,
             "bybit_okx"
         )
+
+
 # =========================
-# MARKET REPORT
+# STATUS
 # =========================
-def market_report():
-    print("\n" + "=" * 60)
-    print("📊 MARKET REPORT")
+
+def print_status():
+
+    print()
     print("=" * 60)
-    print(
-        f"Trade size: ${TRADE_SIZE_USD}"
-    )
-    print(
-        f"Net threshold: "
-        f"{MIN_NET_EDGE * 100:.3f}%"
-    )
-    print("\nData status:")
-    for exchange in books:
-        ready = len(books[exchange])
+    print("V4 MARKET INTELLIGENCE")
+    print("=" * 60)
+
+    print()
+    print("Data status:")
+
+    for exchange in [
+        "binance",
+        "okx",
+        "bybit"
+    ]:
+
+        ready = sum(
+            1
+            for symbol in SYMBOLS
+            if is_fresh(
+                exchange,
+                symbol
+            )
+        )
+
         print(
             f"{exchange.upper():8} "
             f"{ready}/{len(SYMBOLS)} symbols"
         )
-    print("\nOpportunity counts:")
-    for name, count in opportunity_counts.items():
+
+    print()
+    print("Opportunity counts:")
+
+    for route, count in stats.items():
+
         print(
-            f"{name:18} {count}"
+            f"{route:18} {count}"
         )
-    print("=" * 60 + "\n")
+
+    print()
+    print(
+        "Best gross seen:"
+    )
+
+    if best_gross["route"]:
+
+        print(
+            f"{best_gross['route']} "
+            f"{best_gross['symbol']} "
+            f"{best_gross['value'] * 100:.4f}%"
+        )
+
+    else:
+
+        print("None yet")
+
+    print()
+    print(
+        "Best net seen:"
+    )
+
+    if best_net["route"]:
+
+        print(
+            f"{best_net['route']} "
+            f"{best_net['symbol']} "
+            f"{best_net['value'] * 100:.4f}%"
+        )
+
+        print(
+            f"Estimated P&L on ${TRADE_SIZE_USD:.0f}: "
+            f"${best_net['pnl']:.4f}"
+        )
+
+    else:
+
+        print("None yet")
+
+    print()
+    print(
+        "Threshold:",
+        f"{NET_THRESHOLD * 100:.3f}%"
+    )
+
+    print(
+        "Trade size:",
+        f"${TRADE_SIZE_USD:.0f}"
+    )
+
+    print("=" * 60)
+
+
 # =========================
-# MONITOR
+# REPORT LOOP
 # =========================
-async def monitor():
-    last_report = 0
+
+async def reporter():
+
     while True:
-        check_all_markets()
-        now = time.time()
-        if now - last_report >= REPORT_INTERVAL:
-            market_report()
-            last_report = now
-        await asyncio.sleep(0.25)
+
+        await asyncio.sleep(
+            REPORT_INTERVAL
+        )
+
+        run_checks()
+
+        print_status()
+
+
 # =========================
 # MAIN
 # =========================
+
 async def main():
+
     await asyncio.gather(
-        binance(),
-        okx(),
-        bybit(),
-        monitor()
+        binance_stream(),
+        okx_stream(),
+        bybit_stream(),
+        reporter()
     )
+
+
 if __name__ == "__main__":
+
     asyncio.run(main())
