@@ -51,13 +51,22 @@ def calculate_vwap(levels, usd_size):
     remaining_usd = usd_size
     total_base = 0.0
     total_usd = 0.0
-    for price, quantity in levels:
-        price = float(price)
-        quantity = float(quantity)
+    for level in levels:
+        # OKX sends:
+        # [price, quantity, ...]
+        # Binance/Bybit send:
+        # [price, quantity]
+        if len(level) < 2:
+            continue
+        price = float(level[0])
+        quantity = float(level[1])
         if price <= 0 or quantity <= 0:
             continue
         level_usd = price * quantity
-        take_usd = min(remaining_usd, level_usd)
+        take_usd = min(
+            remaining_usd,
+            level_usd
+        )
         if take_usd <= 0:
             continue
         base_amount = take_usd / price
@@ -68,6 +77,7 @@ def calculate_vwap(levels, usd_size):
             break
     if total_base == 0:
         return None
+    # Not enough liquidity for the requested trade size
     if remaining_usd > 0:
         return None
     return total_usd / total_base
