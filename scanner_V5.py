@@ -284,6 +284,7 @@ async def bybit_worker():
     
     while True:
         try:
+            print("BYBIT worker running")
             for symbol in SYMBOLS:
                 params = {
                     "category": "linear",
