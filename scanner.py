@@ -228,7 +228,6 @@ def check_arbitrage():
                 f"Est. profit: ${expected_profit:.2f}\n"
             )
 
-            )
 
 async def monitor():
 
