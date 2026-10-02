@@ -106,10 +106,17 @@ async def binance():
                 print("Binance connected.")
                 async for message in ws:
                     data = json.loads(message)
+                    # Ignore subscription response
                     if "data" not in data:
                         continue
                     payload = data["data"]
-                    symbol = payload.get("s")
+                    # Combined stream contains:
+                    # "stream": "btcusdt@depth20@100ms"
+                    stream_name = data.get("stream")
+                    if not stream_name:
+                        continue
+                    # Extract symbol from stream name
+                    symbol = stream_name.split("@")[0].upper()
                     if symbol not in SYMBOLS:
                         continue
                     bids = payload.get("bids", [])
