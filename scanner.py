@@ -180,7 +180,7 @@ def check_arbitrage():
 
         spread_2 = (sell_binance - buy_okx) / buy_okx
 
-        if spread_1 > 0.001:
+        if spread_1 > 0.0001:
 
             print(
 
@@ -194,7 +194,7 @@ def check_arbitrage():
 
             )
 
-        if spread_2 > 0.001:
+        if spread_2 > 0.0001:
 
             print(
 
