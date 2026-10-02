@@ -285,6 +285,7 @@ async def bybit_worker():
 
     while True:
         try:
+            connection_status["BYBIT"] = "OK"
             print("BYBIT worker running")
 
             async with aiohttp.ClientSession() as session:
