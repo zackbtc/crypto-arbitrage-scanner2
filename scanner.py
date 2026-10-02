@@ -1,26 +1,22 @@
 # ============================================================
-# PERSONAL QUANT SYSTEM — V1
+# PERSONAL QUANT SYSTEM — V1.1
 # DATA ENGINE
 # ============================================================
 #
-# Purpose:
-#   Collect public futures/perpetual market data from:
-#       - Binance
-#       - Bybit
-#       - OKX
+# V1.1 objectives:
+#   - Binance Futures
+#   - Bybit Linear Futures
+#   - OKX Perpetuals
+#   - 5 liquid symbols
+#   - Clean synchronized reporting
+#   - Freshness validation
+#   - Public data only
 #
-#   Symbols:
-#       BTCUSDT
-#       ETHUSDT
-#       SOLUSDT
-#       XRPUSDT
-#       DOGEUSDT
-#
-#   V1 does NOT:
-#       - place orders
-#       - use API keys
-#       - calculate trading signals
-#       - recommend LONG/SHORT
+# NO:
+#   - API keys
+#   - Real orders
+#   - Trading signals
+#   - Position execution
 #
 # ============================================================
 
@@ -48,18 +44,24 @@ REQUEST_TIMEOUT = 8
 
 
 # ============================================================
-# ENDPOINTS
+# API ENDPOINTS
 # ============================================================
 
-BINANCE_URL = "https://fapi.binance.com/fapi/v1/premiumIndex"
+BINANCE_URL = (
+    "https://fapi.binance.com/fapi/v1/premiumIndex"
+)
 
-BYBIT_URL = "https://api.bybit.com/v5/market/tickers"
+BYBIT_URL = (
+    "https://api.bybit.com/v5/market/tickers"
+)
 
-OKX_URL = "https://www.okx.com/api/v5/market/ticker"
+OKX_URL = (
+    "https://www.okx.com/api/v5/market/ticker"
+)
 
 
 # ============================================================
-# DATA STORAGE
+# MARKET DATA STORAGE
 # ============================================================
 
 market_data = {
@@ -78,16 +80,11 @@ def now_ms():
 
 
 def utc_time():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-
-def is_fresh(timestamp_ms):
-    if not timestamp_ms:
-        return False
-
-    age = (now_ms() - timestamp_ms) / 1000
-
-    return age <= STALE_SECONDS
+    return datetime.now(
+        timezone.utc
+    ).strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
+    )
 
 
 def safe_float(value):
@@ -97,11 +94,47 @@ def safe_float(value):
         return None
 
 
+def is_fresh(timestamp_ms):
+
+    if not timestamp_ms:
+        return False
+
+    age = (
+        now_ms() - timestamp_ms
+    ) / 1000
+
+    return age <= STALE_SECONDS
+
+
+def format_price(value):
+
+    if value is None:
+        return "N/A"
+
+    if value >= 1000:
+        return f"${value:,.2f}"
+
+    if value >= 1:
+        return f"${value:,.4f}"
+
+    return f"${value:.6f}"
+
+
+def format_percent(value):
+
+    if value is None:
+        return "N/A"
+
+    return f"{value * 100:+.5f}%"
+
+
 # ============================================================
-# BINANCE
+# BINANCE DATA
 # ============================================================
 
 async def fetch_binance(session):
+
+    result = {}
 
     try:
 
@@ -111,28 +144,31 @@ async def fetch_binance(session):
         ) as response:
 
             if response.status != 200:
-                print(
-                    f"[BINANCE] HTTP ERROR: {response.status}"
-                )
-                return
+                return result
 
             data = await response.json()
 
+            timestamp = now_ms()
+
             for item in data:
 
-                symbol = item.get("symbol")
+                symbol = item.get(
+                    "symbol"
+                )
 
                 if symbol not in SYMBOLS:
                     continue
 
-                market_data["BINANCE"][symbol] = {
-                    "timestamp": now_ms(),
+                result[symbol] = {
+
+                    "timestamp": timestamp,
 
                     "price": safe_float(
                         item.get("markPrice")
                     ),
 
                     "bid": None,
+
                     "ask": None,
 
                     "mark_price": safe_float(
@@ -147,187 +183,272 @@ async def fetch_binance(session):
                         item.get("lastFundingRate")
                     ),
 
-                    "next_funding_time": item.get(
-                        "nextFundingTime"
-                    ),
+                    "next_funding_time":
+                        item.get(
+                            "nextFundingTime"
+                        ),
+
+                    "funding_interval_hour":
+                        8.0,
 
                     "volume": None,
                 }
 
-    except Exception as e:
+    except Exception:
+        pass
 
-        print(f"[BINANCE] ERROR: {e}")
+    return result
 
 
 # ============================================================
-# BYBIT
+# BYBIT DATA
 # ============================================================
 
-async def fetch_bybit(session):
+async def fetch_bybit_symbol(
+    session,
+    symbol
+):
 
     try:
 
-        for symbol in SYMBOLS:
+        params = {
+            "category": "linear",
+            "symbol": symbol,
+        }
 
-            params = {
-                "category": "linear",
-                "symbol": symbol,
-            }
+        async with session.get(
+            BYBIT_URL,
+            params=params,
+            timeout=REQUEST_TIMEOUT
+        ) as response:
 
-            async with session.get(
-                BYBIT_URL,
-                params=params,
-                timeout=REQUEST_TIMEOUT
-            ) as response:
+            if response.status != 200:
+                return symbol, None
 
-                if response.status != 200:
-                    print(
-                        f"[BYBIT] HTTP ERROR {symbol}: "
-                        f"{response.status}"
-                    )
-                    continue
+            data = await response.json()
 
-                data = await response.json()
+            result = data.get(
+                "result",
+                {}
+            )
 
-                result = data.get(
-                    "result",
-                    {}
-                )
+            items = result.get(
+                "list",
+                []
+            )
 
-                items = result.get(
-                    "list",
-                    []
-                )
+            if not items:
+                return symbol, None
 
-                if not items:
-                    continue
+            item = items[0]
 
-                item = items[0]
+            record = {
 
-                market_data["BYBIT"][symbol] = {
-                    "timestamp": now_ms(),
+                "timestamp": now_ms(),
 
-                    "price": safe_float(
-                        item.get("lastPrice")
-                    ),
+                "price": safe_float(
+                    item.get("lastPrice")
+                ),
 
-                    "bid": safe_float(
-                        item.get("bid1Price")
-                    ),
+                "bid": safe_float(
+                    item.get("bid1Price")
+                ),
 
-                    "ask": safe_float(
-                        item.get("ask1Price")
-                    ),
+                "ask": safe_float(
+                    item.get("ask1Price")
+                ),
 
-                    "mark_price": safe_float(
-                        item.get("markPrice")
-                    ),
+                "mark_price": safe_float(
+                    item.get("markPrice")
+                ),
 
-                    "index_price": safe_float(
-                        item.get("indexPrice")
-                    ),
+                "index_price": safe_float(
+                    item.get("indexPrice")
+                ),
 
-                    "funding_rate": safe_float(
-                        item.get("fundingRate")
-                    ),
+                "funding_rate": safe_float(
+                    item.get("fundingRate")
+                ),
 
-                    "next_funding_time": item.get(
+                "next_funding_time":
+                    item.get(
                         "nextFundingTime"
                     ),
 
-                    "funding_interval_hour": safe_float(
-                        item.get("fundingIntervalHour")
+                "funding_interval_hour":
+                    safe_float(
+                        item.get(
+                            "fundingIntervalHour"
+                        )
                     ),
 
-                    "volume": safe_float(
-                        item.get("volume24h")
-                    ),
-                }
+                "volume": safe_float(
+                    item.get("volume24h")
+                ),
+            }
 
-    except Exception as e:
+            return symbol, record
 
-        print(f"[BYBIT] ERROR: {e}")
+    except Exception:
+
+        return symbol, None
+
+
+async def fetch_bybit(session):
+
+    tasks = [
+
+        fetch_bybit_symbol(
+            session,
+            symbol
+        )
+
+        for symbol in SYMBOLS
+    ]
+
+    results = await asyncio.gather(
+        *tasks
+    )
+
+    result = {}
+
+    for symbol, data in results:
+
+        if data is not None:
+            result[symbol] = data
+
+    return result
 
 
 # ============================================================
-# OKX
+# OKX DATA
 # ============================================================
 
-async def fetch_okx(session):
+async def fetch_okx_symbol(
+    session,
+    symbol
+):
 
     try:
 
-        for symbol in SYMBOLS:
-
-            inst_id = symbol.replace(
+        inst_id = (
+            symbol.replace(
                 "USDT",
                 "-USDT-SWAP"
             )
+        )
 
-            params = {
-                "instId": inst_id
+        params = {
+            "instId": inst_id
+        }
+
+        async with session.get(
+            OKX_URL,
+            params=params,
+            timeout=REQUEST_TIMEOUT
+        ) as response:
+
+            if response.status != 200:
+                return symbol, None
+
+            data = await response.json()
+
+            items = data.get(
+                "data",
+                []
+            )
+
+            if not items:
+                return symbol, None
+
+            item = items[0]
+
+            record = {
+
+                "timestamp": now_ms(),
+
+                "price": safe_float(
+                    item.get("last")
+                ),
+
+                "bid": safe_float(
+                    item.get("bidPx")
+                ),
+
+                "ask": safe_float(
+                    item.get("askPx")
+                ),
+
+                "mark_price": None,
+
+                "index_price": None,
+
+                "funding_rate": None,
+
+                "next_funding_time": None,
+
+                "funding_interval_hour": None,
+
+                "volume": safe_float(
+                    item.get("vol24h")
+                ),
             }
 
-            async with session.get(
-                OKX_URL,
-                params=params,
-                timeout=REQUEST_TIMEOUT
-            ) as response:
+            return symbol, record
 
-                if response.status != 200:
-                    print(
-                        f"[OKX] HTTP ERROR {symbol}: "
-                        f"{response.status}"
-                    )
-                    continue
+    except Exception:
 
-                data = await response.json()
+        return symbol, None
 
-                items = data.get(
-                    "data",
-                    []
-                )
 
-                if not items:
-                    continue
+async def fetch_okx(session):
 
-                item = items[0]
+    tasks = [
 
-                market_data["OKX"][symbol] = {
-                    "timestamp": now_ms(),
+        fetch_okx_symbol(
+            session,
+            symbol
+        )
 
-                    "price": safe_float(
-                        item.get("last")
-                    ),
+        for symbol in SYMBOLS
+    ]
 
-                    "bid": safe_float(
-                        item.get("bidPx")
-                    ),
+    results = await asyncio.gather(
+        *tasks
+    )
 
-                    "ask": safe_float(
-                        item.get("askPx")
-                    ),
+    result = {}
 
-                    "mark_price": None,
+    for symbol, data in results:
 
-                    "index_price": None,
+        if data is not None:
+            result[symbol] = data
 
-                    "funding_rate": None,
-
-                    "next_funding_time": None,
-
-                    "volume": safe_float(
-                        item.get("vol24h")
-                    ),
-                }
-
-    except Exception as e:
-
-        print(f"[OKX] ERROR: {e}")
+    return result
 
 
 # ============================================================
-# STATUS
+# DATA COLLECTION
+# ============================================================
+
+async def collect_all_data(session):
+
+    results = await asyncio.gather(
+
+        fetch_binance(session),
+
+        fetch_bybit(session),
+
+        fetch_okx(session),
+    )
+
+    market_data["BINANCE"] = results[0]
+    market_data["BYBIT"] = results[1]
+    market_data["OKX"] = results[2]
+
+
+# ============================================================
+# EXCHANGE STATUS
 # ============================================================
 
 def get_exchange_status(exchange):
@@ -338,61 +459,65 @@ def get_exchange_status(exchange):
 
     for symbol in SYMBOLS:
 
-        data = market_data[exchange].get(symbol)
+        data = market_data[
+            exchange
+        ].get(symbol)
 
-        if data and is_fresh(
+        if data is None:
+            continue
+
+        if is_fresh(
             data.get("timestamp")
         ):
             fresh += 1
 
     if fresh == total:
+
         status = "OK"
 
     elif fresh > 0:
+
         status = "PARTIAL"
 
     else:
+
         status = "OFFLINE"
 
     return status, fresh, total
 
 
 # ============================================================
-# FORMAT HELPERS
-# ============================================================
-
-def format_percent(value):
-
-    if value is None:
-        return "N/A"
-
-    return f"{value * 100:+.5f}%"
-
-
-def format_price(value):
-
-    if value is None:
-        return "N/A"
-
-    return f"${value:,.4f}"
-
-
-# ============================================================
-# REPORT
+# CLEAN REPORT
 # ============================================================
 
 def print_report():
 
     print("\n")
-    print("=" * 72)
-    print("             PERSONAL QUANT SYSTEM — V1")
-    print("                    DATA ENGINE")
+
     print("=" * 72)
 
-    print(f"UTC: {utc_time()}")
+    print(
+        "             PERSONAL QUANT SYSTEM — V1.1"
+    )
+
+    print(
+        "                    DATA ENGINE"
+    )
+
+    print("=" * 72)
+
+    print(
+        f"UTC: {utc_time()}"
+    )
+
     print()
 
+    # --------------------------------------------------------
+    # CONNECTION STATUS
+    # --------------------------------------------------------
+
     print("CONNECTION STATUS")
+
     print("-" * 72)
 
     for exchange in [
@@ -401,8 +526,10 @@ def print_report():
         "OKX",
     ]:
 
-        status, fresh, total = get_exchange_status(
-            exchange
+        status, fresh, total = (
+            get_exchange_status(
+                exchange
+            )
         )
 
         print(
@@ -412,13 +539,24 @@ def print_report():
         )
 
     print()
-    print("=" * 72)
+
+    # --------------------------------------------------------
+    # MARKET DATA
+    # --------------------------------------------------------
 
     for symbol in SYMBOLS:
 
-        print()
-        print(f" {symbol}")
-        print("-" * 72)
+        print(
+            "=" * 72
+        )
+
+        print(
+            f"{symbol}"
+        )
+
+        print(
+            "-" * 72
+        )
 
         for exchange in [
             "BINANCE",
@@ -430,10 +568,11 @@ def print_report():
                 exchange
             ].get(symbol)
 
-            if not data:
+            if data is None:
 
                 print(
-                    f"{exchange:<10} NO DATA"
+                    f"{exchange:<10} "
+                    f"NO DATA"
                 )
 
                 continue
@@ -450,7 +589,7 @@ def print_report():
 
             print(
                 f"{exchange:<10} "
-                f"{freshness:<6} "
+                f"{freshness:<7} "
                 f"Price: "
                 f"{format_price(data.get('price')):<18} "
                 f"Funding: "
@@ -458,9 +597,17 @@ def print_report():
             )
 
     print()
+
     print("=" * 72)
-    print("V1 STATUS: DATA COLLECTION ONLY")
-    print("NO TRADING / NO ORDERS / NO SIGNALS")
+
+    print(
+        "V1.1 STATUS: DATA COLLECTION ONLY"
+    )
+
+    print(
+        "NO TRADING / NO ORDERS / NO SIGNALS"
+    )
+
     print("=" * 72)
 
 
@@ -475,7 +622,7 @@ async def main():
     )
 
     connector = aiohttp.TCPConnector(
-        limit=20
+        limit=30
     )
 
     async with aiohttp.ClientSession(
@@ -485,21 +632,35 @@ async def main():
 
         while True:
 
-            start = time.time()
+            cycle_start = time.time()
 
-            await asyncio.gather(
-                fetch_binance(session),
-                fetch_bybit(session),
-                fetch_okx(session),
+            # ------------------------------------------------
+            # Collect everything first
+            # ------------------------------------------------
+
+            await collect_all_data(
+                session
             )
+
+            # ------------------------------------------------
+            # Print only after all collection is finished
+            # ------------------------------------------------
 
             print_report()
 
-            elapsed = time.time() - start
+            # ------------------------------------------------
+            # Maintain approximately 10-second cycle
+            # ------------------------------------------------
+
+            elapsed = (
+                time.time()
+                - cycle_start
+            )
 
             sleep_time = max(
                 0,
-                UPDATE_INTERVAL - elapsed
+                UPDATE_INTERVAL
+                - elapsed
             )
 
             await asyncio.sleep(
@@ -508,15 +669,20 @@ async def main():
 
 
 # ============================================================
-# ENTRY POINT
+# PROGRAM ENTRY
 # ============================================================
 
 if __name__ == "__main__":
 
     try:
 
-        asyncio.run(main())
+        asyncio.run(
+            main()
+        )
 
     except KeyboardInterrupt:
 
-        print("\nSystem stopped by user.")
+        print()
+        print(
+            "System stopped by user."
+        )
