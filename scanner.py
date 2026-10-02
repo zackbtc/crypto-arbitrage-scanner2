@@ -152,59 +152,81 @@ prices = {
 
 }
 
+TRADE_SIZE_USD = 500
+
+# Conservative starting assumption.
+# We will replace this with the real fee tier later.
+BINANCE_FEE = 0.001
+OKX_FEE = 0.001
+
+MIN_NET_EDGE = 0.0005
+
+
 def check_arbitrage():
 
     for symbol in SYMBOLS:
 
         b = prices["binance"].get(symbol)
-
         o = prices["okx"].get(symbol)
 
         if not b or not o:
-
             continue
 
+        # ==========================================
         # Binance -> OKX
+        # ==========================================
 
-        buy_binance = b["ask"]
+        buy_price = b["ask"]
+        sell_price = o["bid"]
 
-        sell_okx = o["bid"]
+        gross_edge = (sell_price - buy_price) / buy_price
 
-        spread_1 = (sell_okx - buy_binance) / buy_binance
+        fees = BINANCE_FEE + OKX_FEE
 
-        # OKX -> Binance
+        net_edge = gross_edge - fees
 
-        buy_okx = o["ask"]
+        expected_profit = TRADE_SIZE_USD * net_edge
 
-        sell_binance = b["bid"]
-
-        spread_2 = (sell_binance - buy_okx) / buy_okx
-
-        if spread_1 > 0.0001:
+        if net_edge >= MIN_NET_EDGE:
 
             print(
-
-                f"\n🚨 ARBITRAGE {symbol}\n"
-
-                f"BUY Binance: {buy_binance}\n"
-
-                f"SELL OKX:   {sell_okx}\n"
-
-                f"Gross spread: {spread_1 * 100:.3f}%\n"
-
+                f"\n🚨 NET ARBITRAGE {symbol}\n"
+                f"BUY Binance: {buy_price:.4f}\n"
+                f"SELL OKX:   {sell_price:.4f}\n"
+                f"Gross edge: {gross_edge * 100:.3f}%\n"
+                f"Fees:       {fees * 100:.3f}%\n"
+                f"NET EDGE:   {net_edge * 100:.3f}%\n"
+                f"Size:       ${TRADE_SIZE_USD}\n"
+                f"Est. profit: ${expected_profit:.2f}\n"
             )
 
-        if spread_2 > 0.0001:
+        # ==========================================
+        # OKX -> Binance
+        # ==========================================
+
+        buy_price = o["ask"]
+        sell_price = b["bid"]
+
+        gross_edge = (sell_price - buy_price) / buy_price
+
+        fees = OKX_FEE + BINANCE_FEE
+
+        net_edge = gross_edge - fees
+
+        expected_profit = TRADE_SIZE_USD * net_edge
+
+        if net_edge >= MIN_NET_EDGE:
 
             print(
-
-                f"\n🚨 ARBITRAGE {symbol}\n"
-
-                f"BUY OKX:     {buy_okx}\n"
-
-                f"SELL Binance: {sell_binance}\n"
-
-                f"Gross spread: {spread_2 * 100:.3f}%\n"
+                f"\n🚨 NET ARBITRAGE {symbol}\n"
+                f"BUY OKX:     {buy_price:.4f}\n"
+                f"SELL Binance: {sell_price:.4f}\n"
+                f"Gross edge: {gross_edge * 100:.3f}%\n"
+                f"Fees:       {fees * 100:.3f}%\n"
+                f"NET EDGE:   {net_edge * 100:.3f}%\n"
+                f"Size:       ${TRADE_SIZE_USD}\n"
+                f"Est. profit: ${expected_profit:.2f}\n"
+            )
 
             )
 
