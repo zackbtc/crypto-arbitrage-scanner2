@@ -141,101 +141,94 @@ def fmt_apr(value):
 
 async def binance_worker():
     """
-    Binance USD-M Futures mark price stream.
+    Binance USD-M Futures funding data.
 
-    The markPrice stream contains:
-    p = mark price
-    i = index price
-    r = funding rate
-    T = next funding time
+    Uses the public REST premiumIndex endpoint instead
+    of the WebSocket funding stream.
     """
 
-    streams = "/".join(
-        f"{symbol.lower()}@markPrice@1s"
-        for symbol in SYMBOLS
-    )
+    import urllib.request
 
-    url = (
-        "wss://fstream.binance.com/stream?streams="
-        + streams
-    )
+    url = "https://fapi.binance.com/fapi/v1/premiumIndex"
 
     while True:
 
         try:
-            print("BINANCE connecting...")
-
-            async with websockets.connect(
+            request = urllib.request.Request(
                 url,
-                ping_interval=20,
-                ping_timeout=20,
-                close_timeout=5,
-            ) as ws:
-
-                print("BINANCE connected.")
-
-                async for message in ws:
-
-                    try:
-                        payload = json.loads(message)
-
-                        # Combined Binance stream:
-                        # {
-                        #   "stream": "...",
-                        #   "data": {...}
-                        # }
-
-                        data = payload.get("data")
-
-                        if not isinstance(data, dict):
-                            continue
-
-                        symbol = data.get("s")
-
-                        if not symbol:
-                            stream_name = payload.get("stream")
-
-                            if stream_name:
-                                symbol = (
-                                    stream_name
-                                    .split("@")[0]
-                                    .upper()
-                                )
-
-                        if symbol not in SYMBOLS:
-                            continue
-
-                        rate = safe_float(data.get("r"))
-
-                        if rate is None:
-                            continue
-
-                        funding[symbol]["BINANCE"] = rate
-
-                        # Binance markPrice stream does not reliably
-                        # expose instrument-specific interval.
-                        # We use 8h only as an initial research value.
-                        intervals[symbol]["BINANCE"] = 8.0
-
-                        next_time = data.get("T")
-
-                        if next_time is not None:
-                            next_funding[symbol]["BINANCE"] = (
-                                int(next_time)
-                            )
-
-                        last_update[symbol]["BINANCE"] = time.time()
-
-                    except Exception:
-                        continue
-
-        except Exception as e:
-            print(
-                f"BINANCE connection error: {type(e).__name__}"
+                headers={
+                    "User-Agent": "Mozilla/5.0"
+                }
             )
 
-        print("BINANCE reconnecting in 5 seconds...")
-        await asyncio.sleep(5)
+            with urllib.request.urlopen(
+                request,
+                timeout=10
+            ) as response:
+
+                raw_data = response.read().decode("utf-8")
+                data = json.loads(raw_data)
+
+            if not isinstance(data, list):
+                print("BINANCE unexpected response")
+                await asyncio.sleep(10)
+                continue
+
+            received = 0
+
+            for item in data:
+
+                if not isinstance(item, dict):
+                    continue
+
+                symbol = item.get("symbol")
+
+                if symbol not in SYMBOLS:
+                    continue
+
+                rate = safe_float(
+                    item.get("lastFundingRate")
+                )
+
+                if rate is None:
+                    continue
+
+                funding[symbol]["BINANCE"] = rate
+
+                # Initial research assumption.
+                # We will verify instrument-specific intervals
+                # in a later step.
+                intervals[symbol]["BINANCE"] = 8.0
+
+                next_time = item.get(
+                    "nextFundingTime"
+                )
+
+                if next_time is not None:
+                    try:
+                        next_funding[symbol]["BINANCE"] = int(
+                            next_time
+                        )
+                    except Exception:
+                        pass
+
+                last_update[symbol]["BINANCE"] = time.time()
+
+                received += 1
+
+            print(
+                f"BINANCE funding updated: "
+                f"{received}/{len(SYMBOLS)}"
+            )
+
+        except Exception as e:
+
+            print(
+                f"BINANCE REST error: "
+                f"{type(e).__name__}: {e}"
+            )
+
+        await asyncio.sleep(10)
 
 
 # ============================================================
