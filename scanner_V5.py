@@ -293,7 +293,10 @@ async def bybit_worker():
 
                 async with aiohttp.ClientSession() as session:
                     async with session.get(url, params=params, timeout=10) as response:
-                        data = await response.json()
+    data = await response.json()
+
+    if symbol == "BTCUSDT":
+        print("BYBIT RESPONSE:", data)
 
                 if data.get("retCode") != 0:
                     continue
